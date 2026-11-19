@@ -1,4 +1,4 @@
-"""Broker-independent closed-bar signal, risk and trade management rules."""
+﻿"""Broker-independent closed-bar signal, risk and trade management rules."""
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
@@ -18,7 +18,7 @@ class Bar:
     def directional(self, direction):
         if direction == -1:
             return self
-        return Bar(self.time, -self.open, -self.low, -self.high, -self.close)
+        return Bar(self.time, -self.open, -self.low, -self.high, -self.close, self.spread)
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,7 @@ class Signal:
 
 @dataclass
 class Setup:
+    head_time: int
     head: float
     zone_low: float
     zone_high: float
@@ -52,12 +53,16 @@ class Trade:
     def level(self, multiple):
         return self.entry + self.side * multiple * self.risk
 
-    def managed_stop(self, current_stop, ema, tick_size):
+    def breakeven_stop(self, current_stop, tick_size):
         breakeven = self.entry + self.side * self.entry_spread
-        candidates = [current_stop, breakeven]
-        if ema is not None:
-            candidates.append(ema)
-        best = max(candidates, key=lambda price: self.side * price)
+        best = max((current_stop, breakeven), key=lambda price: self.side * price)
+        return round_step(best, tick_size, up=self.side == -1)
+
+    def trail_stop(self, current_stop, m15_bar, tick_size):
+        """Trail behind closed M15 candle extreme once runner is protected at breakeven."""
+        breakeven = self.entry + self.side * self.entry_spread
+        structure_trail = m15_bar.low if self.side == 1 else m15_bar.high
+        best = max((current_stop, breakeven, structure_trail), key=lambda price: self.side * price)
         return round_step(best, tick_size, up=self.side == -1)
 
 
@@ -106,30 +111,49 @@ def pivot(bars, high):
 
 
 def rejects_zone(previous, bar):
+    full_range = bar.high - bar.low
+    if full_range <= 0:
+        return False
     body = abs(bar.open - bar.close)
     engulfing = (
-        previous.close > previous.open and bar.close < bar.open
-        and bar.open >= previous.close and bar.close <= previous.open
+        bar.close < bar.open
+        and bar.close < previous.low
+        and body >= 0.55 * full_range
     )
     upper_wick = bar.high - max(bar.open, bar.close)
     lower_wick = min(bar.open, bar.close) - bar.low
-    pin = bar.close < bar.open and upper_wick >= 2 * body and upper_wick > lower_wick
+    close_position = (bar.close - bar.low) / full_range
+    pin = (
+        upper_wick >= 1.8 * max(body, full_range * 0.05)
+        and upper_wick > lower_wick
+        and close_position <= 0.35
+    )
     return engulfing or pin
 
 
 class Strategy:
-    def __init__(self, settings=SETTINGS):
+    def __init__(self, settings=SETTINGS, utc_offset_hours=0.0):
         self.settings = settings
+        self.utc_offset_seconds = int(round(utc_offset_hours * 3600))
         self.m5 = deque(maxlen=3)
-        self.m15 = deque(maxlen=3)
+        self.m15 = deque(maxlen=40)
         self.pivots = {side: deque(maxlen=4) for side in (-1, 1)}
         self.setups = {}
         self.ema = None
         self.ema_time = None
         self.ema_samples = 0
+        self.last_m15 = None
 
     def in_session(self, timestamp):
-        return True
+        utc_ts = timestamp - self.utc_offset_seconds
+        hour = (utc_ts // 3600) % 24
+        return any(start <= hour < end for start, end in self.settings.sessions)
+
+    def ema_exit_triggered(self, side):
+        """True when the most recently closed M15 bar closed across the M15 21 EMA."""
+        if self.ema is None or self.last_m15 is None:
+            return False
+        return side * (self.last_m15.close - self.ema) < 0
 
     def push(self, bar):
         """Consume one newly closed M5 bar and return at most one next-open signal."""
@@ -145,8 +169,12 @@ class Strategy:
         entry_time = bar.time + BAR_SECONDS
         if len(self.m5) == 3 and entry_time % STRUCTURE_SECONDS == 0:
             first, _, last = self.m5
-            self._structure(Bar(first.time, first.open, max(b.high for b in self.m5),
-                                min(b.low for b in self.m5), last.close))
+            self._structure(Bar(
+                first.time, first.open,
+                max(b.high for b in self.m5),
+                min(b.low for b in self.m5),
+                last.close, last.spread,
+            ))
         signals = []
         if len(self.m5) == 3:
             for side, setup in list(self.setups.items()):
@@ -157,6 +185,7 @@ class Strategy:
 
     def _structure(self, bar):
         self.m15.append(bar)
+        self.last_m15 = bar
         period = self.settings.ema_period
         self.ema_samples += 1
         if self.ema_samples <= period:
@@ -166,9 +195,11 @@ class Strategy:
         self.ema_time = bar.time + STRUCTURE_SECONDS
         if len(self.m15) < 3:
             return
+
+        recent_3 = list(self.m15)[-3:]
         for side, swings in self.pivots.items():
-            candles = [item.directional(side) for item in self.m15]
-            left, center, current = candles
+            candles = [item.directional(side) for item in recent_3]
+            _, center, current = candles
             high, low = pivot(candles, True), pivot(candles, False)
             if high != low:
                 if swings and swings[-1][0] == high:
@@ -177,6 +208,7 @@ class Strategy:
                         swings[-1] = (high, center)
                 else:
                     swings.append((high, center))
+
             if [kind for kind, _ in swings] != [False, True, False, True]:
                 continue
             base, shoulder, neck, head = (candle for _, candle in swings)
@@ -184,44 +216,62 @@ class Strategy:
                 continue
             if self.ema_time - head.time > self.settings.setup_m5_bars * BAR_SECONDS:
                 continue
-            impulse = any(
-                candle.time > head.time and candle.close < neck.low and candle.high > neck.low
-                and candle.open - candle.close
-                >= self.settings.impulse_body_fraction * (candle.high - candle.low)
-                for candle in (center, current)
+
+            dir_m15 = [item.directional(side) for item in self.m15]
+            post_head = [c for c in dir_m15 if c.time > head.time]
+            if not post_head or current.close >= neck.low:
+                continue
+
+            has_bos_impulse = any(
+                c.close < neck.low
+                and (c.high - c.low) > 0
+                and (c.open - c.close) >= self.settings.impulse_body_fraction * (c.high - c.low)
+                for c in post_head
             )
-            impulse &= current.high < left.low and current.close < neck.low
-            if impulse:
-                self.setups[side] = Setup(head.high, max(shoulder.open, shoulder.close),
-                                          shoulder.high, self.ema_time)
+            has_fvg = any(
+                dir_m15[i - 1].time >= head.time
+                and dir_m15[i].high < dir_m15[i - 2].low
+                and (dir_m15[i - 1].open - dir_m15[i - 1].close)
+                >= self.settings.impulse_body_fraction * max(dir_m15[i - 1].high - dir_m15[i - 1].low, 1e-9)
+                for i in range(2, len(dir_m15))
+            )
+            if has_bos_impulse and has_fvg:
+                existing = self.setups.get(side)
+                if existing is None or existing.head_time != head.time:
+                    self.setups[side] = Setup(
+                        head_time=head.time,
+                        head=head.high,
+                        zone_low=max(shoulder.open, shoulder.close),
+                        zone_high=shoulder.high,
+                        formed=self.ema_time,
+                    )
 
     def _trigger(self, side, setup, closed_at):
         candles = [bar.directional(side) for bar in self.m5]
-        left, previous, current = candles
-        if (current.high >= setup.head
-                or closed_at - setup.formed > self.settings.setup_m5_bars * BAR_SECONDS):
+        _, previous, current = candles
+
+        if (
+            current.high >= setup.head
+            or closed_at - setup.formed > self.settings.setup_m5_bars * BAR_SECONDS
+            or current.close > setup.zone_high
+        ):
             del self.setups[side]
             return False
+
         if current.time < setup.formed:
             return False
 
         if setup.swept is None:
             if setup.fakeout is not None and current.high > setup.fakeout:
                 setup.swept = current.time
-            elif left.time >= setup.formed and pivot(candles, True):
+            elif pivot(candles, True) and previous.high < setup.zone_low:
                 setup.fakeout = previous.high
 
         if setup.swept is not None:
             if current.time - setup.swept > self.settings.sweep_to_tap_bars * BAR_SECONDS:
                 del self.setups[side]
                 return False
-            if current.high >= setup.zone_low:
-                if current.close < setup.zone_low:
-                    if rejects_zone(previous, current):
-                        return True
-                if current.close > setup.zone_high:
-                    del self.setups[side]
-                return False
-        elif current.high >= setup.zone_low:
-            del self.setups[side]
+            if current.high >= setup.zone_low and current.close <= setup.zone_high:
+                if rejects_zone(previous, current):
+                    return True
         return False
