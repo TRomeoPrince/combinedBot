@@ -119,19 +119,18 @@ def rejects_zone(previous, bar):
     if full_range <= 0:
         return False
     body = abs(bar.open - bar.close)
-    # Classic bearish engulfing (closes below prior candle body/open) or strong breakdown close
     engulfing = (
         bar.close < bar.open
         and bar.close < min(previous.open, previous.close)
-        and body >= 0.50 * full_range
+        and body >= 0.45 * full_range
     )
     upper_wick = bar.high - max(bar.open, bar.close)
     lower_wick = min(bar.open, bar.close) - bar.low
     close_position = (bar.close - bar.low) / full_range
     pin = (
-        upper_wick >= 1.6 * max(body, full_range * 0.05)
+        upper_wick >= 1.5 * max(body, full_range * 0.05)
         and upper_wick > lower_wick
-        and close_position <= 0.40
+        and close_position <= 0.42
     )
     return engulfing or pin
 
@@ -216,10 +215,13 @@ class Strategy:
                 else:
                     swings.append((high, center))
 
-            if [kind for kind, _ in swings] != [False, True, False, True]:
+            if len(swings) < 3:
                 continue
-            base, shoulder, neck, head = (candle for _, candle in swings)
-            if not (neck.low > base.low and head.high > shoulder.high):
+            last3_swings = list(swings)[-3:]
+            if [kind for kind, _ in last3_swings] != [True, False, True]:
+                continue
+            shoulder, neck, head = (candle for _, candle in last3_swings)
+            if head.high <= shoulder.high:
                 continue
             if self.ema_time - head.time > self.settings.setup_m5_bars * BAR_SECONDS:
                 continue
@@ -238,15 +240,13 @@ class Strategy:
             has_fvg = any(
                 dir_m15[i - 1].time >= head.time
                 and dir_m15[i].high < dir_m15[i - 2].low
-                and (dir_m15[i - 1].open - dir_m15[i - 1].close)
-                >= self.settings.impulse_body_fraction * max(dir_m15[i - 1].high - dir_m15[i - 1].low, 1e-9)
                 for i in range(2, len(dir_m15))
             )
             if has_bos_impulse and has_fvg:
                 existing = self.setups.get(side)
                 if existing is None or existing.head_time != head.time:
-                    zone_low = min(shoulder.open, shoulder.close) if shoulder.close > shoulder.open else max(shoulder.open, shoulder.close)
-                    zone_low = min(zone_low, shoulder.high - 0.35 * (shoulder.high - shoulder.low))
+                    body_top = max(shoulder.open, shoulder.close)
+                    zone_low = min(body_top, shoulder.high - 0.35 * (shoulder.high - shoulder.low))
                     setup = Setup(
                         head_time=head.time,
                         head=head.high,
@@ -254,7 +254,6 @@ class Strategy:
                         zone_high=shoulder.high,
                         formed=self.ema_time,
                     )
-                    # Scan post-head M5 bars so fakeouts engineered before BOS completion are captured
                     m5_dir = [b.directional(side) for b in self.m5 if b.time > head.time + STRUCTURE_SECONDS]
                     for idx in range(2, len(m5_dir)):
                         tri = m5_dir[idx - 2: idx + 1]
@@ -285,11 +284,12 @@ class Strategy:
             elif pivot(candles, True) and previous.high < setup.zone_low:
                 setup.fakeout = previous.high
 
-        if setup.swept is not None:
-            if current.time - setup.swept > self.settings.sweep_to_tap_bars * BAR_SECONDS:
-                del self.setups[side]
-                return False
-            if current.high >= setup.zone_low and current.close <= setup.zone_high:
-                if rejects_zone(previous, current):
-                    return True
+        if setup.swept is not None and current.time - setup.swept > self.settings.sweep_to_tap_bars * BAR_SECONDS:
+            del self.setups[side]
+            return False
+
+        # Trigger on confirmed M5 rejection inside QML zone (whether preceded by fakeout sweep or direct tap)
+        if current.high >= setup.zone_low and current.close <= setup.zone_high:
+            if rejects_zone(previous, current):
+                return True
         return False

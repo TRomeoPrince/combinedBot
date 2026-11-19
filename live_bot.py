@@ -1,4 +1,4 @@
-"""Run the shared strategy against a logged-in local MT5 terminal."""
+﻿"""Run the shared strategy against a logged-in local MT5 terminal."""
 import argparse
 import hashlib
 import json
@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from time import sleep, time
 
-from config import BAR_SECONDS, SETTINGS
+from config import SETTINGS
 from mt5_connector import BrokerError, MT5Connector
 from strategy import Strategy, Trade, drawdown_hit, partial_volume, round_step
 
@@ -136,7 +136,6 @@ class LiveBot:
             self.state.save()
 
         if record["triggered"] is not None:
-            # Always protect at breakeven immediately once +1.5R is hit
             stop = trade.breakeven_stop(position.sl or trade.initial_stop, broker.tick_size)
             if (
                 self.strategy.ema_time is not None
@@ -147,8 +146,6 @@ class LiveBot:
                 if self.strategy.ema_exit_triggered(side):
                     self.close(position, tick)
                     return
-                if self.strategy.last_m15 is not None:
-                    stop = trade.trail_stop(stop, self.strategy.last_m15, broker.tick_size)
 
             if stop != position.sl and broker.levels_valid(side, quote, stop, target, modify=True):
                 broker.modify(position, stop, target)
@@ -195,7 +192,6 @@ class LiveBot:
         if not signal or not broker.can_enter(positions, account):
             return
 
-        # Compare broker-clock tick.time against broker-clock signal.entry_time (never local UTC time())
         tick = broker.tick()
         if not (0 <= tick.time - signal.entry_time <= self.settings.entry_window_seconds):
             return

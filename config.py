@@ -1,4 +1,4 @@
-"""Shared strategy and execution settings."""
+﻿"""Shared strategy and execution settings."""
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,15 +11,15 @@ class Settings:
     spread_reference_point: float = 0.01
     max_concurrent_trades: int = 1
     magic_number: int = 310521
-    sessions: tuple = ((7, 11), (13, 17))
+    sessions: tuple = ((7, 12), (13, 18))
     stop_spread_multiple: float = 1.5
     partial_r: float = 1.5
     partial_fraction: float = 0.5
     target_r: float = 4.0
     ema_period: int = 21
-    impulse_body_fraction: float = 0.50
-    setup_m5_bars: int = 96       # 8 hours max from QML formation to entry
-    sweep_to_tap_bars: int = 12   # 1 hour max from fakeout sweep to QML zone tap
+    impulse_body_fraction: float = 0.40
+    setup_m5_bars: int = 144      # 12 hours max from QML formation to entry
+    sweep_to_tap_bars: int = 24   # 2 hours max from fakeout sweep to QML zone tap
     warmup_bars: int = 600
     poll_seconds: float = 0.25
     entry_window_seconds: int = 10
