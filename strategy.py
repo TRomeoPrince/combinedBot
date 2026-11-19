@@ -8,7 +8,7 @@ from config import BAR_SECONDS, SETTINGS, STRUCTURE_SECONDS
 
 @dataclass(frozen=True)
 class Bar:
-    time: int  # UTC open timestamp
+    time: int  # Timestamp in seconds
     open: float
     high: float
     low: float
@@ -58,13 +58,6 @@ class Trade:
         best = max((current_stop, breakeven), key=lambda price: self.side * price)
         return round_step(best, tick_size, up=self.side == -1)
 
-    def trail_stop(self, current_stop, m15_bar, tick_size):
-        """Trail behind closed M15 candle extreme once runner is protected at breakeven."""
-        breakeven = self.entry + self.side * self.entry_spread
-        structure_trail = m15_bar.low if self.side == 1 else m15_bar.high
-        best = max((current_stop, breakeven, structure_trail), key=lambda price: self.side * price)
-        return round_step(best, tick_size, up=self.side == -1)
-
 
 def round_step(value, step, *, up=False):
     increment = Decimal(str(step))
@@ -110,23 +103,35 @@ def pivot(bars, high):
     return center.low < min(left.low, right.low)
 
 
+def fractal_pivot(bars5, high):
+    """Confirmed 2-bar fractal pivot (2 bars left, 2 bars right) on M15."""
+    b0, b1, center, b3, b4 = bars5
+    step = center.time - b1.time
+    if step <= 0 or (b1.time - b0.time != step) or (b3.time - center.time != step) or (b4.time - b3.time != step):
+        return False
+    if high:
+        return center.high > max(b0.high, b1.high, b3.high, b4.high)
+    return center.low < min(b0.low, b1.low, b3.low, b4.low)
+
+
 def rejects_zone(previous, bar):
     full_range = bar.high - bar.low
     if full_range <= 0:
         return False
     body = abs(bar.open - bar.close)
+    # Classic bearish engulfing (closes below prior candle body/open) or strong breakdown close
     engulfing = (
         bar.close < bar.open
-        and bar.close < previous.low
-        and body >= 0.55 * full_range
+        and bar.close < min(previous.open, previous.close)
+        and body >= 0.50 * full_range
     )
     upper_wick = bar.high - max(bar.open, bar.close)
     lower_wick = min(bar.open, bar.close) - bar.low
     close_position = (bar.close - bar.low) / full_range
     pin = (
-        upper_wick >= 1.8 * max(body, full_range * 0.05)
+        upper_wick >= 1.6 * max(body, full_range * 0.05)
         and upper_wick > lower_wick
-        and close_position <= 0.35
+        and close_position <= 0.40
     )
     return engulfing or pin
 
@@ -135,7 +140,7 @@ class Strategy:
     def __init__(self, settings=SETTINGS, utc_offset_hours=0.0):
         self.settings = settings
         self.utc_offset_seconds = int(round(utc_offset_hours * 3600))
-        self.m5 = deque(maxlen=3)
+        self.m5 = deque(maxlen=60)
         self.m15 = deque(maxlen=40)
         self.pivots = {side: deque(maxlen=4) for side in (-1, 1)}
         self.setups = {}
@@ -167,16 +172,17 @@ class Strategy:
                 swings.clear()
         self.m5.append(bar)
         entry_time = bar.time + BAR_SECONDS
-        if len(self.m5) == 3 and entry_time % STRUCTURE_SECONDS == 0:
-            first, _, last = self.m5
-            self._structure(Bar(
-                first.time, first.open,
-                max(b.high for b in self.m5),
-                min(b.low for b in self.m5),
-                last.close, last.spread,
-            ))
+        if len(self.m5) >= 3 and entry_time % STRUCTURE_SECONDS == 0:
+            last3 = list(self.m5)[-3:]
+            if last3[-1].time - last3[0].time == 2 * BAR_SECONDS:
+                self._structure(Bar(
+                    last3[0].time, last3[0].open,
+                    max(b.high for b in last3),
+                    min(b.low for b in last3),
+                    last3[-1].close, last3[-1].spread,
+                ))
         signals = []
-        if len(self.m5) == 3:
+        if len(self.m5) >= 3:
             for side, setup in list(self.setups.items()):
                 if self._trigger(side, setup, entry_time):
                     signals.append(Signal(side, setup.head * -side, entry_time))
@@ -193,14 +199,15 @@ class Strategy:
         else:
             self.ema += 2 / (period + 1) * (bar.close - self.ema)
         self.ema_time = bar.time + STRUCTURE_SECONDS
-        if len(self.m15) < 3:
+        if len(self.m15) < 5:
             return
 
-        recent_3 = list(self.m15)[-3:]
+        recent_5 = list(self.m15)[-5:]
         for side, swings in self.pivots.items():
-            candles = [item.directional(side) for item in recent_3]
-            _, center, current = candles
-            high, low = pivot(candles, True), pivot(candles, False)
+            candles5 = [item.directional(side) for item in recent_5]
+            center = candles5[2]
+            current = candles5[4]
+            high, low = fractal_pivot(candles5, True), fractal_pivot(candles5, False)
             if high != low:
                 if swings and swings[-1][0] == high:
                     prior = swings[-1][1]
@@ -238,16 +245,27 @@ class Strategy:
             if has_bos_impulse and has_fvg:
                 existing = self.setups.get(side)
                 if existing is None or existing.head_time != head.time:
-                    self.setups[side] = Setup(
+                    zone_low = min(shoulder.open, shoulder.close) if shoulder.close > shoulder.open else max(shoulder.open, shoulder.close)
+                    zone_low = min(zone_low, shoulder.high - 0.35 * (shoulder.high - shoulder.low))
+                    setup = Setup(
                         head_time=head.time,
                         head=head.high,
-                        zone_low=max(shoulder.open, shoulder.close),
+                        zone_low=zone_low,
                         zone_high=shoulder.high,
                         formed=self.ema_time,
                     )
+                    # Scan post-head M5 bars so fakeouts engineered before BOS completion are captured
+                    m5_dir = [b.directional(side) for b in self.m5 if b.time > head.time + STRUCTURE_SECONDS]
+                    for idx in range(2, len(m5_dir)):
+                        tri = m5_dir[idx - 2: idx + 1]
+                        if pivot(tri, True) and tri[1].high < setup.zone_low:
+                            setup.fakeout = tri[1].high
+                        elif setup.fakeout is not None and tri[2].high > setup.fakeout and tri[2].high < setup.zone_high:
+                            setup.swept = tri[2].time
+                    self.setups[side] = setup
 
     def _trigger(self, side, setup, closed_at):
-        candles = [bar.directional(side) for bar in self.m5]
+        candles = [bar.directional(side) for bar in list(self.m5)[-3:]]
         _, previous, current = candles
 
         if (

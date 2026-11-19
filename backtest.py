@@ -1,4 +1,4 @@
-"""Replay MT5 M5 exports with bid OHLC and a per-bar ask spread."""
+﻿"""Replay MT5 M5 exports with bid OHLC and a per-bar ask spread."""
 import argparse
 import csv
 from dataclasses import dataclass
@@ -8,6 +8,13 @@ from statistics import mean
 
 from config import DATA_DIR, SETTINGS
 from strategy import Bar, Strategy, drawdown_hit, new_trade, partial_volume, risk_volume
+
+KNOWN_OFFSETS = {
+    "XAUUSDm_M5_Exness.csv": 0.0,
+    "XAUUSD.m_JustMarkets.csv": 2.0,
+    "XAUUSD_M5_Headway.csv": 2.0,
+    "XAUUSD_M5_202505090150_202610081640.csv": 2.0,
+}
 
 
 @dataclass
@@ -39,17 +46,23 @@ def load_bars(path):
 
 def replay(path, utc_offset, starting_equity, contract_size):
     strategy = Strategy(utc_offset_hours=utc_offset)
-    balance = baseline = starting_equity
+    balance = peak = baseline = starting_equity
+    max_dd_pct = 0.0
     day = position = signal = last = None
     locked = False
     outcomes = []
     lot_min = lot_step = 0.01
 
     def liquidate(price):
-        nonlocal balance, position
+        nonlocal balance, peak, max_dd_pct, position
         trade = position.trade
         profit = trade.side * (price - trade.entry) * position.volume * contract_size
         balance += profit
+        if balance > peak:
+            peak = balance
+        dd = (peak - balance) / peak * 100 if peak > 0 else 0.0
+        if dd > max_dd_pct:
+            max_dd_pct = dd
         outcomes.append((profit + position.realized) / (trade.risk * position.initial_volume * contract_size))
         position = None
 
@@ -82,18 +95,11 @@ def replay(path, utc_offset, starting_equity, contract_size):
             side = trade.side
             shift = bar.spread if side == -1 else 0
             exit_open = bar.open + shift
-            adverse = (bar.low if side == 1 else bar.high) + shift
-            favorable = (bar.high if side == 1 else bar.low) + shift
-            stop = position.stop
 
-            # Check M15 21 EMA close exit and structure trail on newly closed M15 bars
+            # Pure M15 21 EMA close exit for runner (no tight 1-bar trailing stop)
             if position.partial_done and strategy.ema_time == bar.time:
                 if strategy.ema_exit_triggered(side):
                     liquidate(exit_open)
-                elif strategy.last_m15 is not None:
-                    proposed = trade.trail_stop(stop, strategy.last_m15, point)
-                    if side * (exit_open - proposed) > 0:
-                        stop = position.stop = proposed
 
         if position:
             trade = position.trade
@@ -124,7 +130,6 @@ def replay(path, utc_offset, starting_equity, contract_size):
                     position.volume = round(position.volume - volume, 10)
                     position.partial_done = True
                     position.stop = trade.breakeven_stop(stop, point)
-                    # Conservative SL-first check if both partial and new BE stop hit on same M5 bar
                     if side * (adverse - position.stop) <= 0:
                         liquidate(position.stop)
                 if position and side * (favorable - target) >= 0:
@@ -136,14 +141,21 @@ def replay(path, utc_offset, starting_equity, contract_size):
 
     if position:
         liquidate(last.close + (last.spread if position.trade.side == -1 else 0))
-    return len(outcomes), mean(outcomes) if outcomes else 0.0, balance
+
+    wins = sum(1 for r in outcomes if r > 0)
+    gross_win = sum(r for r in outcomes if r > 0)
+    gross_loss = abs(sum(r for r in outcomes if r < 0))
+    pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
+    win_rate = (wins / len(outcomes) * 100) if outcomes else 0.0
+    net_r = sum(outcomes)
+    return len(outcomes), win_rate, net_r, mean(outcomes) if outcomes else 0.0, pf, max_dd_pct, balance
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
-    parser.add_argument("--utc-offset", type=float, default=0,
-                        help="Hours east of UTC in the exported timestamps")
+    parser.add_argument("--utc-offset", type=float, default=None,
+                        help="Override UTC offset for all feeds (defaults to known broker offsets)")
     parser.add_argument("--feed-offset", action="append", default=[], metavar="FILE=HOURS",
                         help="Override the timestamp offset for a particular CSV filename")
     parser.add_argument("--equity", type=float, default=10000)
@@ -155,14 +167,17 @@ def main():
         parser.error("provide a data directory with CSV feeds and positive equity and contract size")
     passed = 0
     for path in feeds:
-        count, expectancy, balance = replay(
-            path, offsets.get(path.name, args.utc_offset), args.equity, args.contract_size
+        offset = offsets.get(path.name, args.utc_offset if args.utc_offset is not None else KNOWN_OFFSETS.get(path.name, 0.0))
+        count, win_rate, net_r, expectancy, pf, max_dd, balance = replay(
+            path, offset, args.equity, args.contract_size
         )
         qualifies = count >= 100 and expectancy > 0
         passed += qualifies
         expected = f"{expectancy:+.4f}R" if count else "n/a"
-        print(f"{path.name}: {count} trades | expectancy {expected} | equity {balance:.2f}"
-              f" | {'PASS' if qualifies else 'FAIL'}")
+        print(
+            f"{path.name} (UTC+{offset:g}): {count} trades | WR {win_rate:.1f}% | Net {net_r:+.2f}R "
+            f"| Avg {expected} | PF {pf:.2f} | DD {max_dd:.2f}% | Eq {balance:.2f} | {'PASS' if qualifies else 'FAIL'}"
+        )
     print(f"Validation: {'PASS' if len(feeds) == 4 and passed >= 3 else 'FAIL'}"
           f" ({passed}/{len(feeds)} qualifying feeds; require 3 of 4)")
 
