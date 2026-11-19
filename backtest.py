@@ -2,7 +2,7 @@
 import argparse
 import csv
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
 
@@ -20,23 +20,25 @@ class Position:
     realized: float = 0.0
 
 
-def load_bars(path, utc_offset):
+def load_bars(path):
     with path.open(encoding="utf-8-sig", newline="") as source:
         reader = csv.DictReader(source, delimiter="\t")
         fields = ("<OPEN>", "<HIGH>", "<LOW>", "<CLOSE>")
-        zone = timezone(timedelta(hours=utc_offset))
         for row in reader:
             timestamp = datetime.strptime(
                 row["<DATE>"] + " " + row["<TIME>"], "%Y.%m.%d %H:%M:%S"
-            ).replace(tzinfo=zone)
+            ).replace(tzinfo=timezone.utc)
             digits = len(row["<OPEN>"].partition(".")[2])
             point = 10 ** -digits
-            yield Bar(int(timestamp.timestamp()), *(float(row[key]) for key in fields),
-                      int(row["<SPREAD>"]) * point), point
+            yield Bar(
+                int(timestamp.timestamp()),
+                *(float(row[key]) for key in fields),
+                int(row["<SPREAD>"]) * point,
+            ), point
 
 
 def replay(path, utc_offset, starting_equity, contract_size):
-    strategy = Strategy()
+    strategy = Strategy(utc_offset_hours=utc_offset)
     balance = baseline = starting_equity
     day = position = signal = last = None
     locked = False
@@ -51,10 +53,10 @@ def replay(path, utc_offset, starting_equity, contract_size):
         outcomes.append((profit + position.realized) / (trade.risk * position.initial_volume * contract_size))
         position = None
 
-    for bar, point in load_bars(path, utc_offset):
+    for bar, point in load_bars(path):
         if last and bar.time <= last.time:
             raise ValueError(f"{path.name}: duplicate or unordered bars at {bar.time}")
-        new_day = bar.time // 86400
+        new_day = (bar.time - int(round(utc_offset * 3600))) // 86400
         if position:
             trade = position.trade
             shift = bar.spread if trade.side == -1 else 0
@@ -83,10 +85,25 @@ def replay(path, utc_offset, starting_equity, contract_size):
             adverse = (bar.low if side == 1 else bar.high) + shift
             favorable = (bar.high if side == 1 else bar.low) + shift
             stop = position.stop
+
+            # Check M15 21 EMA close exit and structure trail on newly closed M15 bars
             if position.partial_done and strategy.ema_time == bar.time:
-                proposed = trade.managed_stop(stop, strategy.ema, point)
-                if side * (exit_open - proposed) > 0:
-                    stop = position.stop = proposed
+                if strategy.ema_exit_triggered(side):
+                    liquidate(exit_open)
+                elif strategy.last_m15 is not None:
+                    proposed = trade.trail_stop(stop, strategy.last_m15, point)
+                    if side * (exit_open - proposed) > 0:
+                        stop = position.stop = proposed
+
+        if position:
+            trade = position.trade
+            side = trade.side
+            shift = bar.spread if side == -1 else 0
+            exit_open = bar.open + shift
+            adverse = (bar.low if side == 1 else bar.high) + shift
+            favorable = (bar.high if side == 1 else bar.low) + shift
+            stop = position.stop
+
             guard_equity = baseline * (1 - SETTINGS.max_daily_loss_percent / 100)
             guard = trade.entry + side * (guard_equity - balance) / (position.volume * contract_size)
             first_stop = max((stop, guard), key=lambda price: side * price)
@@ -106,15 +123,17 @@ def replay(path, utc_offset, starting_equity, contract_size):
                     position.realized += gain
                     position.volume = round(position.volume - volume, 10)
                     position.partial_done = True
-                    position.stop = trade.managed_stop(stop, None, point)
-                    # Intrabar ordering is unknown. Favor the new stop if both levels were reached.
+                    position.stop = trade.breakeven_stop(stop, point)
+                    # Conservative SL-first check if both partial and new BE stop hit on same M5 bar
                     if side * (adverse - position.stop) <= 0:
                         liquidate(position.stop)
                 if position and side * (favorable - target) >= 0:
                     liquidate(target)
+
         locked |= drawdown_hit(balance, baseline) if position is None else False
         signal = strategy.push(bar)
         last = bar
+
     if position:
         liquidate(last.close + (last.spread if position.trade.side == -1 else 0))
     return len(outcomes), mean(outcomes) if outcomes else 0.0, balance

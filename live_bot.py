@@ -56,14 +56,15 @@ class LiveState:
 
 
 class LiveBot:
-    def __init__(self, broker, state):
+    def __init__(self, broker, state, utc_offset_hours=0.0):
         self.broker = broker
         self.state = state
         self.settings = broker.settings
-        self.strategy = Strategy(self.settings)
+        self.strategy = Strategy(self.settings, utc_offset_hours=utc_offset_hours)
         self.current_open = None
         self.account_id = account_identity(broker.account())
         self.unconfirmed_close = None
+        self.last_checked_ema_time = None
 
     def update_bars(self):
         bars = self.broker.bars(2)
@@ -92,15 +93,19 @@ class LiveBot:
             raise BrokerError(f"Missing original risk state for MT5 position {position.ticket}")
         info = self.broker.info
         closing = partial_volume(position.volume, info.volume_min, info.volume_step, self.settings)
-        record = dict(id=position.identifier, stop=intent["stop"], spread=intent["spread"],
-                      remaining=round(position.volume - closing, 10), triggered=None)
+        record = dict(
+            id=position.identifier,
+            stop=intent["stop"],
+            spread=intent["spread"],
+            remaining=round(position.volume - closing, 10),
+            triggered=None,
+        )
         self.state.data["trade"] = record
         self.state.data.pop("intent", None)
         self.state.save()
         return record
 
     def close(self, position, tick, volume=None):
-        # Give ambiguous or asynchronous responses time to reconcile against broker state.
         if self.unconfirmed_close:
             ticket, previous_volume, attempted = self.unconfirmed_close
             if ticket == position.ticket and position.volume == previous_volume and time() - attempted < 15:
@@ -119,49 +124,65 @@ class LiveBot:
         if trade.risk <= 0:
             self.close(position, tick)
             return
+
         quote = broker.exit_quote(side, tick)
         target = broker.target(trade)
         if side * (quote - target) >= 0:
             self.close(position, tick)
             return
+
         if record["triggered"] is None and side * (quote - trade.level(self.settings.partial_r)) >= 0:
             record["triggered"] = tick.time
             self.state.save()
+
         if record["triggered"] is not None:
+            # Always protect at breakeven immediately once +1.5R is hit
+            stop = trade.breakeven_stop(position.sl or trade.initial_stop, broker.tick_size)
+            if (
+                self.strategy.ema_time is not None
+                and self.strategy.ema_time > record["triggered"]
+                and self.strategy.ema_time != self.last_checked_ema_time
+            ):
+                self.last_checked_ema_time = self.strategy.ema_time
+                if self.strategy.ema_exit_triggered(side):
+                    self.close(position, tick)
+                    return
+                if self.strategy.last_m15 is not None:
+                    stop = trade.trail_stop(stop, self.strategy.last_m15, broker.tick_size)
+
+            if stop != position.sl and broker.levels_valid(side, quote, stop, target, modify=True):
+                broker.modify(position, stop, target)
+
             step = broker.info.volume_step
             to_close = round_step(position.volume - record["remaining"], step)
             if to_close >= broker.info.volume_min:
                 self.close(position, tick, to_close)
-                return
-            ema = self.strategy.ema if (self.strategy.ema_time or 0) > record["triggered"] else None
-            stop = trade.managed_stop(position.sl or trade.initial_stop, ema, broker.tick_size)
         else:
             stop = position.sl or trade.initial_stop
-        if (stop != position.sl or target != position.tp) and broker.levels_valid(
-            side, quote, stop, target, modify=True
-        ):
-            broker.modify(position, stop, target)
+            if (stop != position.sl or target != position.tp) and broker.levels_valid(
+                side, quote, stop, target, modify=True
+            ):
+                broker.modify(position, stop, target)
 
     def step(self):
         broker = self.broker
         account = broker.account()
         if account_identity(account) != self.account_id:
             raise RuntimeError("MT5 switched accounts; restart the bot on the intended account")
-        now = time()
-        locked = self.state.check_drawdown(int(now) // 86400, account.equity, self.settings)
+
+        locked = self.state.check_drawdown(int(time()) // 86400, account.equity, self.settings)
         positions = broker.positions()
         owned = broker.owned(positions)
         if locked:
             broker.cancel_entries()
+
         tick = broker.tick()
-        tick_at = tick.time_msc / 1000 if tick.time_msc else tick.time
-        if not -1 <= time() - tick_at <= self.settings.entry_window_seconds:
-            return
         if locked:
             for position in owned:
                 self.close(position, tick)
             self.update_bars()
             return
+
         if owned:
             try:
                 self.update_bars()
@@ -169,22 +190,29 @@ class LiveBot:
                 for position in owned:
                     self.manage(position, tick)
             return
+
         signal = self.update_bars()
         if not signal or not broker.can_enter(positions, account):
             return
+
+        # Compare broker-clock tick.time against broker-clock signal.entry_time (never local UTC time())
         tick = broker.tick()
-        tick_at = tick.time_msc / 1000 if tick.time_msc else tick.time
-        if not (signal.entry_time <= tick_at and
-                time() - signal.entry_time <= self.settings.entry_window_seconds):
+        if not (0 <= tick.time - signal.entry_time <= self.settings.entry_window_seconds):
             return
+
         previous = self.state.data.get("intent")
         if previous and previous["time"] >= signal.entry_time:
             return
+
         plan = broker.entry_plan(signal, tick, account)
         if plan:
             trade, volume = plan
-            self.state.data["intent"] = dict(time=signal.entry_time, side=trade.side,
-                                             stop=trade.initial_stop, spread=trade.entry_spread)
+            self.state.data["intent"] = dict(
+                time=signal.entry_time,
+                side=trade.side,
+                stop=trade.initial_stop,
+                spread=trade.entry_spread,
+            )
             self.state.save()
             broker.open(trade, volume)
 
@@ -197,6 +225,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbol", default="XAUUSD", help="Exact broker symbol including suffix")
     parser.add_argument("--terminal", help="Path to terminal64.exe")
+    parser.add_argument("--utc-offset", type=float, default=0.0,
+                        help="Broker MT5 server hours east of UTC (e.g., 2 or 3 for EET, 0 for Exness)")
     parser.add_argument("--state-dir", type=Path, default=Path(__file__).resolve().parent / ".mt5_state")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -206,8 +236,12 @@ def main():
         args.state_dir.mkdir(parents=True, exist_ok=True)
         key = hashlib.sha256(repr(account_identity(broker.account())).encode()).hexdigest()[:16]
         with exclusive_run(args.state_dir / f"{key}.lock"):
-            bot = LiveBot(broker, LiveState(args.state_dir / f"{key}-{SETTINGS.magic_number}.json"))
-            LOG.info("Started for %s on account %s", args.symbol, bot.account_id[1])
+            bot = LiveBot(
+                broker,
+                LiveState(args.state_dir / f"{key}-{SETTINGS.magic_number}.json"),
+                utc_offset_hours=args.utc_offset,
+            )
+            LOG.info("Started for %s on account %s (server UTC%+g)", args.symbol, bot.account_id[1], args.utc_offset)
             while True:
                 try:
                     bot.step()

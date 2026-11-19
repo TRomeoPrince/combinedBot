@@ -17,13 +17,13 @@ class Settings:
     partial_fraction: float = 0.5
     target_r: float = 4.0
     ema_period: int = 21
-    impulse_body_fraction: float = 0.30
-    setup_m5_bars: int = 144
-    sweep_to_tap_bars: int = 12
+    impulse_body_fraction: float = 0.50
+    setup_m5_bars: int = 96       # 8 hours max from QML formation to entry
+    sweep_to_tap_bars: int = 12   # 1 hour max from fakeout sweep to QML zone tap
     warmup_bars: int = 600
     poll_seconds: float = 0.25
-    entry_window_seconds: int = 5
-    deviation_points: int = 10
+    entry_window_seconds: int = 10
+    deviation_points: int = 15
 
     def accepts_spread(self, spread):
         return 0 < spread <= self.max_spread_points * self.spread_reference_point + 1e-9
